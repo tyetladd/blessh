@@ -1,0 +1,46 @@
+#!/usr/bin/make -f
+# The Rust crates are bundled in vendor/ (packaging/vendor-tarball.sh):
+# Launchpad builds offline. Ubuntu 24.04 builds with rustc-1.89 (uuid needs 1.89).
+export CARGO_HOME = $(CURDIR)/debian/cargo-home
+CARGO := $(shell command -v cargo-1.89 || command -v cargo)
+RUSTC := $(shell command -v rustc-1.89 || command -v rustc)
+RUSTDOC := $(shell command -v rustdoc-1.89 || command -v rustdoc)
+export RUSTC RUSTDOC
+D = $(CURDIR)/debian/blessh
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p .cargo
+	printf '[source.crates-io]\nreplace-with = "vendored-sources"\n\n[source.vendored-sources]\ndirectory = "vendor"\n' > .cargo/config.toml
+
+override_dh_auto_build:
+	$(CARGO) build --release --offline --locked -p blessh-client
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(CARGO) test --release --offline --locked -p blessh-core
+endif
+
+override_dh_auto_install:
+	install -Dpm 0755 target/release/blessh $(D)/usr/bin/blessh
+	install -Dpm 0755 packaging/linux/eatt-off $(D)/usr/lib/blessh/eatt-off
+	install -Dpm 0644 packaging/linux/sshd_config $(D)/etc/blessh/sshd_config
+	install -Dpm 0644 packaging/linux/default $(D)/etc/default/blessh
+	install -Dpm 0644 -t $(D)/usr/lib/systemd/system packaging/linux/systemd/blessh-server.service packaging/linux/systemd/blessh-session.socket packaging/linux/systemd/blessh-session@.service
+	install -Dpm 0644 packaging/linux/sysusers.conf $(D)/usr/lib/sysusers.d/blessh.conf
+	install -Dpm 0644 packaging/linux/dbus.conf $(D)/usr/share/dbus-1/system.d/blessh.conf
+	install -Dpm 0644 -t $(D)/usr/share/doc/blessh README.md docs/protocol.md
+
+# The maintainer scripts (packaging/linux/debian) create the user, reload
+# systemd and leave the server off until `blessh server enable`.
+override_dh_installsystemd override_dh_installsysusers:
+
+# dh_clean deletes *.orig files, and every vendored crate has a
+# Cargo.toml.orig that cargo checksums.
+override_dh_clean:
+	dh_clean -X.orig
+
+override_dh_auto_clean:
+	rm -rf target .cargo debian/cargo-home

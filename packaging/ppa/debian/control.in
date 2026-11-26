@@ -1,0 +1,21 @@
+Source: blessh
+Section: net
+Priority: optional
+Maintainer: @MAINTAINER@
+Build-Depends: debhelper-compat (= 13), @RUST@, gcc, pkgconf
+Standards-Version: 4.7.0
+Homepage: https://github.com/tyetladd/blessh
+Rules-Requires-Root: no
+
+Package: blessh
+Architecture: amd64 arm64
+Depends: ${shlibs:Depends}, ${misc:Depends}, bluez (>= 5.55), openssh-client, systemd
+Suggests: openssh-server
+Description: SSH over Bluetooth Low Energy: client and server
+ blessh runs SSH over Bluetooth Low Energy, without pairing: the SSH host
+ key and login provide the security. As a client, blessh lists the servers
+ in range and runs the system ssh through the one chosen. As a server, it
+ is off until "blessh server enable": an unprivileged daemon then registers
+ a GATT service with BlueZ, listens on L2CAP connection-oriented channels
+ and hands each session to a per-session "sshd -i" started by systemd
+ socket activation, with the system SSH server's configuration.
