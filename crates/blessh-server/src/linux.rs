@@ -411,20 +411,40 @@ async fn adapter_present(session: &bluer::Session, name: &str) -> bluer::Result<
     Ok(session.adapter_names().await?.iter().any(|a| a == name))
 }
 
-async fn wait_powered(adapter: &Adapter) -> bluer::Result<()> {
+/// Resolves when the daemon should stop (SIGTERM or Ctrl-C).
+async fn stopping(sigterm: &mut tokio::signal::unix::Signal) {
+    tokio::select! {
+        _ = sigterm.recv() => {}
+        _ = tokio::signal::ctrl_c() => {}
+    }
+}
+
+/// Waits for the adapter to be powered; `false` when `stop` completes first.
+async fn wait_powered(adapter: &Adapter, stop: impl Future<Output = ()>) -> bluer::Result<bool> {
+    tokio::pin!(stop);
     let mut last_hint = None;
-    while !adapter.is_powered().await? {
+    loop {
+        let powered = tokio::select! {
+            _ = &mut stop => return Ok(false),
+            powered = adapter.is_powered() => powered?,
+        };
+        if powered {
+            break;
+        }
         let hint = power_hint(adapter.name());
         if last_hint.as_ref() != Some(&hint) {
             warn!("Bluetooth adapter {} is off: {hint}", adapter.name());
             last_hint = Some(hint);
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = &mut stop => return Ok(false),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
     }
     if last_hint.is_some() {
         info!("Bluetooth adapter {} is on", adapter.name());
     }
-    Ok(())
+    Ok(true)
 }
 
 const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
@@ -524,20 +544,16 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
     };
     loop {
         let (session, sigterm) = (&p.session, &mut p.sigterm);
-        let adapter = wait_adapter(session, args.adapter.as_deref(), async {
-            tokio::select! {
-                _ = sigterm.recv() => {}
-                _ = tokio::signal::ctrl_c() => {}
-            }
-        })
-        .await?;
+        let adapter = wait_adapter(session, args.adapter.as_deref(), stopping(sigterm)).await?;
         let Some(adapter) = adapter else {
             break;
         };
         // The adapter part is set up again if it comes back, so its
         // removal must not end the resumable sessions.
         let adapter_name = adapter.name().to_owned();
-        wait_powered(&adapter).await?;
+        if !wait_powered(&adapter, stopping(&mut p.sigterm)).await? {
+            break;
+        }
         match serve_adapter(&mut p, adapter, &args, &name).await? {
             AdapterEnd::Stopped => break,
             AdapterEnd::Removed => info!(

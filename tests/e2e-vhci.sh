@@ -226,8 +226,10 @@ fi
 echo "== daemon keeps resumable sessions while its adapter goes away and comes back"
 removals() { grep -c "is gone; keeping" "$T/daemon.log" 2>/dev/null || true; }
 resumable() { grep -c "resumable SSH session started" "$T/daemon.log" 2>/dev/null || true; }
+resumed() { grep -c "resumed (resume" "$T/daemon.log" 2>/dev/null || true; }
 wait_link_down
 started=$(resumable)
+resumed_before=$(resumed)
 BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --resume 60 --scan-timeout 60" timeout 300 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
     -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" \
     "$(id -un)@$SERVER" 'for i in $(seq 1 90); do echo tick $i; sleep 1; done' \
@@ -257,13 +259,17 @@ grep -q "is gone; keeping 1 resumable session(s) while it comes back" "$T/daemon
 [ "$(grep -c "advertising as" "$T/daemon.log")" -ge 2 ] ||
     { echo "FAIL: the daemon did not advertise again"; exit 1; }
 kill -0 "$D" 2>/dev/null || { echo "FAIL: the daemon restarted"; exit 1; }
-expected=$(seq 1 90 | sed 's/^/tick /')
-got=$(cat "$T/ticks.log")
-if [ "$TICKS_STATUS" = 0 ] && grep -q "resumed (resume" "$T/daemon.log" && [ "$got" = "$expected" ]; then
-    echo "   client resumed, the stream had no gap"
-else
+if [ "$TICKS_STATUS" -ne 0 ]; then
     echo "NOTE: client side not checked (client adapter was removed too)"
     echo "   client exit status $TICKS_STATUS, $(wc -l < "$T/ticks.log") ticks"
+else
+    [ "$(resumed)" -gt "$resumed_before" ] ||
+        { echo "FAIL: the client did not resume its session"; exit 1; }
+    expected=$(seq 1 90 | sed 's/^/tick /')
+    got=$(cat "$T/ticks.log")
+    [ "$got" = "$expected" ] ||
+        { echo "FAIL: the tick stream has a gap ($(wc -l < "$T/ticks.log") of 90 lines)"; exit 1; }
+    echo "   client resumed, the stream had no gap"
 fi
 
 echo "== daemon stops while its adapter is gone"
@@ -287,6 +293,44 @@ wait "$D" || STATUS=$?
 kill "$WATCH" 2>/dev/null || true
 [ "$STATUS" = 0 ] ||
     { echo "FAIL: the daemon exited with status $STATUS after SIGTERM while the adapter was gone"; exit 1; }
+
+echo "== daemon stops while its adapter is powered off"
+# The previous case stopped the daemon with the adapter absent. Bring the
+# adapter back but switch it off: a fresh daemon finds it in wait_powered
+# and must still end promptly on SIGTERM.
+sudo btvirt -L -l2 > "$T/btvirt2.log" 2>&1 &
+for _ in $(seq 60); do
+    busctl get-property org.bluez "/org/bluez/$SERVER_HCI" org.bluez.Adapter1 Powered >/dev/null 2>&1 && break
+    sleep 0.5
+done
+POWERED=
+for _ in $(seq 60); do
+    sudo btmgmt --index "${SERVER_HCI#hci}" power off >/dev/null 2>&1 || true
+    POWERED=$(busctl get-property org.bluez "/org/bluez/$SERVER_HCI" org.bluez.Adapter1 Powered 2>/dev/null || true)
+    [ "$POWERED" = "b false" ] && break
+    sleep 0.5
+done
+[ "$POWERED" = "b false" ] || { echo "FAIL: cannot power $SERVER_HCI off"; exit 1; }
+RUST_LOG=debug "$BIN/blessh" server run $DAEMON_ARGS > "$T/daemon2.log" 2>&1 &
+D2=$!
+trap 'kill $D $SA $D2 2>/dev/null || true' EXIT
+for _ in $(seq 60); do
+    grep -q " is off" "$T/daemon2.log" && break
+    sleep 0.5
+done
+grep -q " is off" "$T/daemon2.log" ||
+    { echo "FAIL: the daemon did not wait for the powered-off adapter"; cat "$T/daemon2.log"; exit 1; }
+! grep -q "advertising as" "$T/daemon2.log" ||
+    { echo "FAIL: the second daemon served although the adapter is off"; cat "$T/daemon2.log"; exit 1; }
+kill -TERM "$D2" 2>/dev/null || { echo "FAIL: the second daemon is not running"; exit 1; }
+( sleep 5; kill -KILL "$D2" 2>/dev/null ) &
+WATCH=$!
+STATUS=0
+wait "$D2" || STATUS=$?
+kill "$WATCH" 2>/dev/null || true
+[ "$STATUS" = 0 ] ||
+    { echo "FAIL: daemon exit status $STATUS after SIGTERM while the adapter was off"; exit 1; }
+sudo btmgmt --index "${SERVER_HCI#hci}" power on >/dev/null 2>&1 || true
 
 grep -E "rejecting|no longer connected|did not open|refused" "$T/daemon.log" | sed 's/^/   daemon: /' || true
 echo PASS
