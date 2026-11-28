@@ -21,9 +21,19 @@ pub struct Rebind {
 }
 
 /// Finds the driver directory and the device name of adapter `hci` under
-/// `sysfs`. `Ok(None)` when the adapter has no driver link, as with vhci.
+/// `sysfs`. `Ok(None)` when there is nothing to rebind: a virtual
+/// controller has no `device` link, and a device can have no `driver`
+/// link.
 pub fn find(sysfs: &Path, hci: &str) -> io::Result<Option<(PathBuf, String)>> {
-    let device = fs::canonicalize(sysfs.join("class/bluetooth").join(hci).join("device"))?;
+    let adapter = sysfs.join("class/bluetooth").join(hci);
+    // An adapter that does not exist is an error; one that exists but has
+    // no device link is a virtual controller and is not resettable.
+    fs::metadata(&adapter)?;
+    let device = match fs::canonicalize(adapter.join("device")) {
+        Ok(device) => device,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
     let driver = match fs::canonicalize(device.join("driver")) {
         Ok(driver) => driver,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -177,6 +187,14 @@ mod tests {
     fn no_driver_is_not_resettable() {
         let tree = tree(false);
         assert!(find(tree.path(), "hci0").unwrap().is_none());
+    }
+
+    #[test]
+    fn vhci_is_not_resettable() {
+        let tree = tree(true);
+        // A virtual controller has no device link to a bus device.
+        fs::create_dir_all(tree.path().join("class/bluetooth/hci1")).unwrap();
+        assert!(find(tree.path(), "hci1").unwrap().is_none());
     }
 
     #[test]
