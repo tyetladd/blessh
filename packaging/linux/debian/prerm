@@ -5,7 +5,7 @@ set -e
 # the links `blessh server enable` made (also without a running systemd).
 if [ "$1" = remove ]; then
     if [ -d /run/systemd/system ]; then
-        systemctl stop blessh-server.service blessh-session.socket || true
+        systemctl stop blessh-server.service blessh-session.socket blessh-adapter-watch.service || true
     fi
     systemctl disable blessh-server.service blessh-session.socket > /dev/null 2>&1 || true
 fi

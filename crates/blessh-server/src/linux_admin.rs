@@ -19,6 +19,8 @@ use crate::report::{check, info, Level};
 
 const UNITS: [&str; 2] = ["blessh-session.socket", "blessh-server.service"];
 const UNIT_FILE: &str = "/usr/lib/systemd/system/blessh-server.service";
+const WATCH_UNIT: &str = "blessh-adapter-watch.service";
+const WATCH_LAST_RESET: &str = "/run/blessh-adapter-watch/last-reset";
 const DEFAULTS: &str = "/etc/default/blessh";
 const SSHD: &str = "/usr/sbin/sshd";
 const SSHD_CONFIG: &str = "/etc/blessh/sshd_config";
@@ -124,20 +126,55 @@ fn parse_channels(main_conf: &str) -> Option<u32> {
         .next_back()
 }
 
-/// The server's options from /etc/default/blessh (`BLESSH_ARGS="..."`).
-fn server_args(defaults: &str) -> Vec<String> {
+/// A variable's value in /etc/default/blessh (the last setting wins).
+fn defaults_value<'a>(defaults: &'a str, name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
     defaults
         .lines()
-        .filter_map(|l| l.trim().strip_prefix("BLESSH_ARGS="))
+        .filter_map(|l| l.trim().strip_prefix(&prefix))
         .next_back()
-        .map(|a| {
-            a.trim()
-                .trim_matches('"')
-                .split_whitespace()
-                .map(str::to_owned)
-                .collect()
-        })
+        .map(|v| v.trim().trim_matches('"'))
+}
+
+/// The server's options from /etc/default/blessh (`BLESSH_ARGS="..."`).
+fn server_args(defaults: &str) -> Vec<String> {
+    defaults_value(defaults, "BLESSH_ARGS")
+        .map(|a| a.split_whitespace().map(str::to_owned).collect())
         .unwrap_or_default()
+}
+
+/// The value of `--adapter` in an argument string, as in
+/// /etc/default/blessh.
+fn adapter_arg(args: &str) -> Option<&str> {
+    let mut words = args.split_whitespace();
+    while let Some(word) = words.next() {
+        if let Some(value) = word.strip_prefix("--adapter=") {
+            return Some(value);
+        }
+        if word == "--adapter" {
+            return words.next();
+        }
+    }
+    None
+}
+
+/// Whether the daemon and the watchdog watch different adapters: only
+/// when both arguments name one, as the watchdog otherwise picks its own.
+fn adapter_mismatch(defaults: &str) -> bool {
+    let server = adapter_arg(defaults_value(defaults, "BLESSH_ARGS").unwrap_or_default());
+    let watch = adapter_arg(defaults_value(defaults, "BLESSH_WATCH_ARGS").unwrap_or_default());
+    matches!((server, watch), (Some(a), Some(b)) if a != b)
+}
+
+/// What the adapter watchdog does, for `status`.
+fn watchdog_state(defaults: &str) -> &'static str {
+    if defaults_value(defaults, "BLESSH_ADAPTER_WATCH") == Some("no") {
+        "off (BLESSH_ADAPTER_WATCH=no)"
+    } else if unit_state("is-active", WATCH_UNIT) == "active" {
+        "on"
+    } else {
+        "not running"
+    }
 }
 
 fn option_value<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
@@ -421,7 +458,8 @@ fn check_units(adapter_ok: bool) -> bool {
 }
 
 fn status() -> i32 {
-    let args = server_args(&std::fs::read_to_string(DEFAULTS).unwrap_or_default());
+    let defaults = std::fs::read_to_string(DEFAULTS).unwrap_or_default();
+    let args = server_args(&defaults);
     let bluez = check_bluez();
     check_eatt(bluez);
     check_bluetooth_service();
@@ -453,6 +491,13 @@ fn status() -> i32 {
         &format!("BLESSH_ARGS in {DEFAULTS}, then sudo systemctl restart blessh-server"),
     );
     info("Logs", "journalctl -u blessh-server -u 'blessh-session@*'");
+    println!("adapter watchdog: {}", watchdog_state(&defaults));
+    if let Ok(last) = std::fs::read_to_string(WATCH_LAST_RESET) {
+        println!("last reset: {}", last.trim_end());
+    }
+    if adapter_mismatch(&defaults) {
+        println!("warning: --adapter differs between BLESSH_ARGS and BLESSH_WATCH_ARGS");
+    }
     if running {
         0
     } else {
@@ -490,6 +535,23 @@ mod tests {
         assert_eq!(option_value(&a, "--name"), Some("my-pi"));
         assert!(server_args("BLESSH_ARGS=\"\"\n").is_empty());
         assert!(server_args("#BLESSH_ARGS=\"--name x\"\n").is_empty());
+    }
+
+    #[test]
+    fn watch_adapter_mismatch() {
+        assert_eq!(adapter_arg("--adapter hci1 --name x"), Some("hci1"));
+        assert_eq!(adapter_arg("--adapter=hci1"), Some("hci1"));
+        assert_eq!(adapter_arg(""), None);
+        assert!(adapter_mismatch(
+            "BLESSH_ARGS=\"--adapter hci0\"\nBLESSH_WATCH_ARGS=\"--adapter hci1\"\n"
+        ));
+        assert!(!adapter_mismatch(
+            "BLESSH_ARGS=\"--adapter hci0\"\nBLESSH_WATCH_ARGS=\"--adapter hci0\"\n"
+        ));
+        // The warning needs both adapters: one argument alone is fine.
+        assert!(!adapter_mismatch("BLESSH_ARGS=\"--adapter hci0\"\n"));
+        assert!(!adapter_mismatch("BLESSH_WATCH_ARGS=\"--adapter hci1\"\n"));
+        assert!(!adapter_mismatch(""));
     }
 
     #[test]

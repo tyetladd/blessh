@@ -56,6 +56,7 @@ assets = [
     ["../../packaging/linux/sshd_config", "etc/blessh/sshd_config", "644"],
     ["../../packaging/linux/default", "etc/default/blessh", "644"],
     ["../../packaging/linux/systemd/blessh-server.service", "usr/lib/systemd/system/", "644"],
+    ["../../packaging/linux/systemd/blessh-adapter-watch.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/linux/systemd/blessh-session.socket", "usr/lib/systemd/system/", "644"],
     ["../../packaging/linux/systemd/blessh-session@.service", "usr/lib/systemd/system/", "644"],
     ["../../packaging/linux/sysusers.conf", "usr/lib/sysusers.d/blessh.conf", "644"],

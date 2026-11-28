@@ -6,3 +6,14 @@
 #   BLESSH_ARGS="--discoverable"   also show the server in the Bluetooth
 #                                  device lists of phones and computers
 BLESSH_ARGS=""
+
+# The adapter watchdog (blessh-adapter-watch.service) starts with the
+# server and resets the Bluetooth controller when it stops answering. It
+# watches the lowest-numbered adapter unless BLESSH_WATCH_ARGS names
+# another one: if BLESSH_ARGS above has --adapter, give the watchdog the
+# same one. BLESSH_ADAPTER_WATCH=no turns the watchdog off.
+# Its options: blessh server adapter-watch --help
+# Examples:
+#   BLESSH_WATCH_ARGS="--adapter hci1"
+#   BLESSH_ADAPTER_WATCH=no
+BLESSH_WATCH_ARGS=""

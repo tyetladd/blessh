@@ -42,7 +42,9 @@ export BLESSH_BASE="$T/release"
 sh "$T/install.sh" --bogus > "$T/out" 2>&1; rc=$?
 [ $rc != 0 ] && grep -q 'unknown option --bogus' "$T/out"
 check "installer refuses an unknown option" $?
-sed 's/^\(SHA256_AMD64=\).*/\1'"$(printf '0%.0s' $(seq 64))"'/' "$T/install.sh" > "$T/bad.sh"
+zeros=$(printf '0%.0s' $(seq 64))
+sed -e "s/^\(SHA256_AMD64=\).*/\1$zeros/" -e "s/^\(SHA256_ARM64=\).*/\1$zeros/" \
+    "$T/install.sh" > "$T/bad.sh"
 sh "$T/bad.sh" > "$T/out" 2>&1; rc=$?
 [ $rc != 0 ] && grep -q 'does not match its checksum' "$T/out" && ! installed
 check "installer refuses a package with a wrong checksum" $?
@@ -134,6 +136,13 @@ grep -qx 'RuntimeDirectory=sshd' /usr/lib/systemd/system/blessh-session@.service
 check "session unit creates /run/sshd (no tmpfiles line)" $?
 grep -qx 'ListenStream=/run/blessh/session.sock' /usr/lib/systemd/system/blessh-session.socket
 check "session socket path" $?
+grep -qx 'Wants=blessh-adapter-watch.service' /usr/lib/systemd/system/blessh-server.service
+check "the server wants the adapter watchdog" $?
+[ -f /usr/lib/systemd/system/blessh-adapter-watch.service ] &&
+    grep -q '^ExecStart=/usr/bin/blessh server adapter-watch' /usr/lib/systemd/system/blessh-adapter-watch.service
+check "the adapter watchdog unit is installed" $?
+systemd-analyze verify /usr/lib/systemd/system/blessh-server.service /usr/lib/systemd/system/blessh-adapter-watch.service
+check "systemd-analyze verify accepts both units" $?
 
 blessh --help | grep -q '^Usage: blessh \[ssh options\]'
 check "client prints its usage" $?

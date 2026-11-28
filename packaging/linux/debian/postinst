@@ -30,6 +30,9 @@ if [ "$1" = configure ]; then
             if systemctl -q is-active bluetooth.service || systemctl -q is-enabled bluetooth.service; then
                 systemctl restart blessh-server.service
             fi
+            # The watchdog is PartOf the server, so a server restart already
+            # restarts it; this covers an upgrade where the server stays.
+            systemctl restart blessh-adapter-watch.service 2>/dev/null || true
             echo "blessh $(dpkg-query -W -f '${Version}' blessh): the server was restarted"
             /usr/bin/blessh server status || true
         fi

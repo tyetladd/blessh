@@ -217,6 +217,39 @@ fn default_adapter(sysfs: &Path) -> String {
     }
 }
 
+/// The `last-reset` file's line: an RFC 3339 UTC time, then what the
+/// watchdog did.
+fn last_reset_line(secs: libc::time_t, description: &str) -> String {
+    // SAFETY: `gmtime_r` gets a valid time and writes to `tm`.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let ok = unsafe { libc::gmtime_r(&secs, &mut tm) };
+    let (year, month, day, hour, minute, second) = if ok.is_null() {
+        (1970, 1, 1, 0, 0, 0)
+    } else {
+        (
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+        )
+    };
+    format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z {description}\n")
+}
+
+/// Writes the time and outcome of a reset attempt for `blessh server
+/// status`; failing to write is only logged.
+fn write_last_reset(directory: &Path, description: &str) {
+    let mut now: libc::time_t = 0;
+    // SAFETY: `time` writes to a valid `time_t`.
+    unsafe { libc::time(&mut now) };
+    let path = directory.join("last-reset");
+    if let Err(e) = fs::write(&path, last_reset_line(now, description)) {
+        warn!("cannot write {}: {e}", path.display());
+    }
+}
+
 /// The watchdog loop: probe every `interval`, feed the results to the
 /// policy, and act on its decision.
 ///
@@ -231,6 +264,11 @@ async fn run<C: Controller + Send + 'static>(
 ) {
     let name = ctrl.name().to_owned();
     info!("watching {name}: probing every {}s", interval.as_secs());
+    // `blessh server status` reads the last reset from here; outside
+    // systemd's RuntimeDirectory there is nowhere to write it.
+    let last_reset_dir = std::env::var_os("RUNTIME_DIRECTORY")
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from);
     let mut ctrl = ctrl;
     tokio::pin!(stop);
     loop {
@@ -265,14 +303,22 @@ async fn run<C: Controller + Send + 'static>(
                     };
                     ctrl = c;
                     let now = tokio::time::Instant::now().into();
-                    match reset {
+                    let outcome = match reset {
                         Ok(Some(description)) => {
                             warn!("{name} did not answer {misses} probes; resetting ({description}). If this repeats, check the power supply and the kernel log.");
+                            description
                         }
                         Ok(None) => {
                             warn!("{name} did not answer {misses} probes and cannot be reset (no driver to rebind)");
+                            "not resettable (no driver to rebind)".into()
                         }
-                        Err(e) => error!("{name}: cannot reset the controller: {e}"),
+                        Err(e) => {
+                            error!("{name}: cannot reset the controller: {e}");
+                            format!("reset failed: {e}")
+                        }
+                    };
+                    if let Some(directory) = &last_reset_dir {
+                        write_last_reset(directory, &outcome);
                     }
                     // A failed or impossible reset spends the cooldown and
                     // counts towards the limit too, so a controller that
@@ -367,6 +413,18 @@ mod tests {
                 Ok(Some("rebind hci_uart_bcm (serial0-0)".into()))
             }
         }
+    }
+
+    #[test]
+    fn last_reset_record() {
+        assert_eq!(
+            last_reset_line(0, "rebind hci_uart_bcm (serial0-0)"),
+            "1970-01-01T00:00:00Z rebind hci_uart_bcm (serial0-0)\n"
+        );
+        assert_eq!(
+            last_reset_line(1_700_000_000, "x"),
+            "2023-11-14T22:13:20Z x\n"
+        );
     }
 
     /// The gaps between consecutive probes, in seconds.
