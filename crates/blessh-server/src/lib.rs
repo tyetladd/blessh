@@ -19,6 +19,8 @@ mod macos_admin;
 mod report;
 #[cfg(target_os = "linux")]
 mod session;
+#[cfg(target_os = "linux")]
+mod watch;
 
 pub const USAGE: &str = "\
 Usage: blessh server <command> [options]
