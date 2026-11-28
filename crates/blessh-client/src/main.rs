@@ -75,7 +75,10 @@ fn main() {
     let server =
         first == Some("server") && args.get(2).map_or(true, |c| blessh_server::is_command(c));
     let printing = match first {
-        Some("server") => !matches!(args.get(2).map(String::as_str), Some("run" | "session")),
+        Some("server") => !matches!(
+            args.get(2).map(String::as_str),
+            Some("run" | "session" | "adapter-watch")
+        ),
         Some("scan" | "-h" | "--help" | "help" | "-V" | "--version") | None => true,
         _ => false,
     };

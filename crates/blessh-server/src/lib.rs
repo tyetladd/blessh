@@ -38,7 +38,15 @@ Commands:
 pub fn is_command(word: &str) -> bool {
     matches!(
         word,
-        "run" | "enable" | "disable" | "status" | "session" | "help" | "-h" | "--help"
+        "run"
+            | "enable"
+            | "disable"
+            | "status"
+            | "session"
+            | "adapter-watch"
+            | "help"
+            | "-h"
+            | "--help"
     )
 }
 
@@ -63,6 +71,8 @@ pub fn main(args: &[String]) -> i32 {
         "enable" | "disable" | "status" => admin(cmd, argv()),
         #[cfg(target_os = "linux")]
         "session" => session::main(argv()),
+        #[cfg(target_os = "linux")]
+        "adapter-watch" => watch::main(argv()),
         _ => {
             eprintln!("blessh server: unknown command {cmd:?}\n\n{USAGE}");
             2

@@ -58,6 +58,18 @@ impl Default for Limits {
     }
 }
 
+impl Limits {
+    /// How many resets are allowed within one window.
+    pub fn max_resets(&self) -> usize {
+        self.max_resets
+    }
+
+    /// The sliding window the reset count applies to.
+    pub fn window(&self) -> Duration {
+        self.window
+    }
+}
+
 /// The watchdog's state: consecutive misses, recent resets, the cooldown
 /// and whether it gave up or is waiting for the controller to answer after
 /// a reset.
@@ -136,6 +148,16 @@ impl Policy {
         self.resets.push_back(now);
         self.after_reset = true;
         self.cooldown_until = Some(now + self.limits.cooldown);
+    }
+
+    /// The thresholds this policy was built with, for the log lines.
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+
+    /// The consecutive probes the controller did not answer.
+    pub fn misses(&self) -> u32 {
+        self.misses
     }
 
     /// Drops reset times that are older than the window.
