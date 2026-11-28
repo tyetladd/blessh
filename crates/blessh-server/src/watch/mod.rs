@@ -7,3 +7,9 @@
 // is added to this module separately, so only the tests use it for now.
 #[allow(dead_code)]
 mod policy;
+
+// The reset unbinds the adapter's driver and binds it again. The command
+// that drives it is added to this module separately, so it is unused for
+// now.
+#[allow(dead_code)]
+mod reset;
