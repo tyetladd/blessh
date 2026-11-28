@@ -6,3 +6,5 @@
 pub mod bluez;
 #[cfg(target_os = "macos")]
 pub mod corebluetooth;
+#[cfg(target_os = "linux")]
+pub mod hci;
