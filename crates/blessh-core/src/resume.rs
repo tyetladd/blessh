@@ -935,6 +935,9 @@ where
                     break 'session ClientEnd::Lost(format!("server cannot resume: {why}"))
                 }
                 Wake::Tried(Reconnect::Failed(why)) => {
+                    if state.local_done {
+                        break 'session ClientEnd::Local;
+                    }
                     log(&format!("resume attempt {attempt}: {why}"));
                     let wait = run_detached(local, &mut state, async {
                         tokio::select! {
@@ -947,6 +950,11 @@ where
                     .await;
                     if let Some(end) = wait {
                         break 'session end;
+                    }
+                    // ssh has closed its side of the proxy: resuming would
+                    // keep an orphaned client alive for the whole window.
+                    if state.local_done {
+                        break 'session ClientEnd::Local;
                     }
                 }
                 Wake::Tried(Reconnect::Attached(mut c, g)) => {

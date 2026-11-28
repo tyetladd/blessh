@@ -212,7 +212,8 @@ fn sets_option(args: &[String], name: &str) -> bool {
     })
 }
 
-/// Resolves when ssh ends its ProxyCommand (SIGHUP or SIGTERM).
+/// Resolves when ssh ends its ProxyCommand (SIGHUP or SIGTERM) or the user
+/// interrupts it (SIGINT, Ctrl-C).
 /// Options of the first channel's hello: a resumable session, unless
 /// `--resume 0`.
 pub fn first_options(args: &ProxyArgs) -> blessh_core::channel::Options {
@@ -267,10 +268,12 @@ pub fn resumed_exit_code(summary: &blessh_core::resume::ClientSummary) -> i32 {
 pub fn stop_signal() -> std::io::Result<impl Future<Output = ()>> {
     let mut hup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
     Ok(async move {
         tokio::select! {
             _ = hup.recv() => {}
             _ = term.recv() => {}
+            _ = int.recv() => {}
         }
     })
 }

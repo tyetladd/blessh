@@ -639,6 +639,48 @@ async fn run_client_gives_up_when_no_channel_comes_back() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn run_client_stops_when_its_local_side_closes_while_resuming() {
+    let registry = Registry::default();
+    let (server_local, _sshd) = tokio::io::duplex(2048);
+    let (mut c1, s1) = tokio::io::duplex(1024);
+    let reg = registry.clone();
+    let srv = tokio::spawn(async move {
+        server_channel(s1, reg, Some(server_local), Duration::from_secs(30)).await
+    });
+    let grant = open(&mut c1, None).await.unwrap();
+    let _session = srv.await.unwrap().unwrap();
+    let (c1, cut) = cuttable(c1);
+    cut.send(()).unwrap();
+    // ssh closes its side while the client is trying to resume: the proxy
+    // must not keep retrying after its parent is gone.
+    let (mut local, app) = tokio::io::duplex(2048);
+    let mut app = Some(app);
+    let reconnect = move |_req: ResumeRequest| {
+        drop(app.take());
+        Box::pin(async { Reconnect::<Watched<DuplexStream>>::Failed("no link yet".into()) })
+            as std::pin::Pin<Box<dyn Future<Output = Reconnect<Watched<DuplexStream>>> + Send>>
+    };
+    let summary = run_client(
+        &mut local,
+        c1,
+        grant,
+        ClientConfig {
+            replay: REPLAY,
+            give_up: Duration::from_secs(30),
+        },
+        reconnect,
+        std::future::pending(),
+        |_| {},
+    )
+    .await;
+    assert!(
+        matches!(summary.end, ClientEnd::Local),
+        "client kept resuming after its local side closed: {:?}",
+        summary.end
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn run_client_stops_at_a_refused_resume() {
     let registry = Registry::default();
     let (server_local, _sshd) = tokio::io::duplex(2048);
