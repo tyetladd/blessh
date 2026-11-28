@@ -264,16 +264,20 @@ async fn run<C: Controller + Send + 'static>(
                         _ = &mut stop => return,
                     };
                     ctrl = c;
+                    let now = tokio::time::Instant::now().into();
                     match reset {
                         Ok(Some(description)) => {
                             warn!("{name} did not answer {misses} probes; resetting ({description}). If this repeats, check the power supply and the kernel log.");
-                            policy.reset_done(tokio::time::Instant::now().into());
                         }
                         Ok(None) => {
                             warn!("{name} did not answer {misses} probes and cannot be reset (no driver to rebind)");
                         }
                         Err(e) => error!("{name}: cannot reset the controller: {e}"),
                     }
+                    // A failed or impossible reset spends the cooldown and
+                    // counts towards the limit too, so a controller that
+                    // cannot be reset is not retried in a loop.
+                    policy.reset_done(now);
                 }
                 Action::GaveUp => {
                     let limits = policy.limits();
@@ -314,15 +318,29 @@ mod tests {
     /// the virtual time of each probe and the resets.
     struct Fake {
         script: VecDeque<Probe>,
+        fail_reset: bool,
         record: Arc<Mutex<Record>>,
     }
 
     impl Fake {
         fn new(script: impl IntoIterator<Item = Probe>) -> (Self, Arc<Mutex<Record>>) {
+            Self::with_reset(script, false)
+        }
+
+        /// A fake whose resets always fail.
+        fn failing(script: impl IntoIterator<Item = Probe>) -> (Self, Arc<Mutex<Record>>) {
+            Self::with_reset(script, true)
+        }
+
+        fn with_reset(
+            script: impl IntoIterator<Item = Probe>,
+            fail_reset: bool,
+        ) -> (Self, Arc<Mutex<Record>>) {
             let record = Arc::new(Mutex::new(Record::default()));
             (
                 Self {
                     script: script.into_iter().collect(),
+                    fail_reset,
                     record: Arc::clone(&record),
                 },
                 record,
@@ -343,7 +361,11 @@ mod tests {
 
         fn reset(&mut self) -> Result<Option<String>, String> {
             self.record.lock().unwrap().resets += 1;
-            Ok(Some("rebind hci_uart_bcm (serial0-0)".into()))
+            if self.fail_reset {
+                Err("the driver did not bind".into())
+            } else {
+                Ok(Some("rebind hci_uart_bcm (serial0-0)".into()))
+            }
         }
     }
 
@@ -407,5 +429,23 @@ mod tests {
         // The first two probes are one interval apart; the third waits out
         // the 30 s cooldown after the reset.
         assert_eq!(gaps(&record.probes), vec![5, 30]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_resets_count_toward_the_limit() {
+        let (fake, record) = Fake::failing([Probe::NoAnswer; 16]);
+        run(
+            fake,
+            Duration::from_secs(5),
+            Policy::new(Limits::default()),
+            tokio::time::sleep(Duration::from_secs(117)),
+        )
+        .await;
+        let record = record.lock().unwrap();
+        // Three failed attempts, each followed by the 30 s cooldown; the
+        // fourth pair of misses gives up instead of resetting again.
+        assert_eq!(record.resets, 3);
+        assert_eq!(record.probes.len(), 9);
+        assert_eq!(gaps(&record.probes), vec![5, 30, 5, 30, 5, 30, 5, 5]);
     }
 }
