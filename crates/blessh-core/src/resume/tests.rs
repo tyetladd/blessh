@@ -319,6 +319,21 @@ async fn a_session_survives_a_lost_channel_byte_for_byte() {
 }
 
 #[tokio::test]
+async fn registry_len_counts_sessions() {
+    let registry = Registry::default();
+    assert_eq!(registry.len(), 0);
+    let (server_local, _sshd) = tokio::io::duplex(2048);
+    let (mut c, s) = tokio::io::duplex(1024);
+    let reg = registry.clone();
+    let srv = tokio::spawn(async move {
+        server_channel(s, reg, Some(server_local), Duration::from_secs(30)).await
+    });
+    let _grant = open(&mut c, None).await.unwrap();
+    let _session = srv.await.unwrap().unwrap();
+    assert_eq!(registry.len(), 1);
+}
+
+#[tokio::test]
 async fn sshd_exit_ends_the_session_with_close() {
     let registry = Registry::default();
     let (server_local, mut sshd) = tokio::io::duplex(2048);

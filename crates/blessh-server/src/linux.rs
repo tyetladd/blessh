@@ -4,6 +4,7 @@
 
 use std::{
     collections::HashMap,
+    future::Future,
     io,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -130,10 +131,6 @@ impl Sessions {
 
     fn has(&self, addr: Address) -> bool {
         self.per_device.contains_key(&addr)
-    }
-
-    fn devices(&self) -> Vec<Address> {
-        self.per_device.keys().copied().collect()
     }
 }
 
@@ -368,21 +365,32 @@ fn power_hint(adapter: &str) -> String {
     }
 }
 
-async fn wait_adapter(session: &bluer::Session, name: Option<&str>) -> bluer::Result<Adapter> {
+/// Waits for the adapter to appear; `Ok(None)` when `stop` completes first.
+async fn wait_adapter(
+    session: &bluer::Session,
+    name: Option<&str>,
+    stop: impl Future<Output = ()>,
+) -> bluer::Result<Option<Adapter>> {
+    tokio::pin!(stop);
     let mut warned = false;
     loop {
-        let found = match name {
-            Some(n) => session
-                .adapter_names()
-                .await?
-                .iter()
-                .any(|a| a == n)
-                .then(|| session.adapter(n))
-                .transpose()?,
-            None => session.default_adapter().await.ok(),
+        let found = tokio::select! {
+            _ = &mut stop => return Ok(None),
+            found = async {
+                match name {
+                    Some(n) => session
+                        .adapter_names()
+                        .await?
+                        .iter()
+                        .any(|a| a == n)
+                        .then(|| session.adapter(n))
+                        .transpose(),
+                    None => Ok(session.default_adapter().await.ok()),
+                }
+            } => found?,
         };
         if let Some(a) = found {
-            return Ok(a);
+            return Ok(Some(a));
         }
         if !warned {
             warn!(
@@ -391,8 +399,16 @@ async fn wait_adapter(session: &bluer::Session, name: Option<&str>) -> bluer::Re
             );
             warned = true;
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::select! {
+            _ = &mut stop => return Ok(None),
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+        }
     }
+}
+
+/// Whether BlueZ still has the adapter.
+async fn adapter_present(session: &bluer::Session, name: &str) -> bluer::Result<bool> {
+    Ok(session.adapter_names().await?.iter().any(|a| a == name))
 }
 
 async fn wait_powered(adapter: &Adapter) -> bluer::Result<()> {
@@ -412,7 +428,8 @@ async fn wait_powered(adapter: &Adapter) -> bluer::Result<()> {
 }
 
 const HALF_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a stopping daemon waits for the active session to send CLOSE.
+/// How long a stopping daemon gives its sessions to end after the shutdown
+/// signal.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(1);
 
 /// How a session ended, for the main loop.
@@ -473,10 +490,76 @@ async fn wait_interfaces(adapter: &Adapter) -> bluer::Result<()> {
     }
 }
 
+/// Why one adapter instance's part of the daemon ended.
+enum AdapterEnd {
+    /// The adapter went away; the process and its sessions stay.
+    Removed,
+    /// The daemon is stopping.
+    Stopped,
+}
+
+/// What lives as long as the daemon: the BlueZ session, the session table,
+/// the resumable sessions and the stop signal. `serve` keeps it while the
+/// adapter goes away, and `serve_adapter` sets the adapter's part up again
+/// when it comes back.
+struct Process {
+    session: bluer::Session,
+    sessions: Shared,
+    registry: Registry,
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
+    sigterm: tokio::signal::unix::Signal,
+}
+
 async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error>> {
     let session = bluer::Session::new().await?;
-    let adapter = wait_adapter(&session, args.adapter.as_deref()).await?;
-    wait_powered(&adapter).await?;
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let mut p = Process {
+        session,
+        sessions: Arc::default(),
+        registry: Registry::default(),
+        shutdown_tx,
+        shutdown_rx,
+        sigterm: tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?,
+    };
+    loop {
+        let (session, sigterm) = (&p.session, &mut p.sigterm);
+        let adapter = wait_adapter(session, args.adapter.as_deref(), async {
+            tokio::select! {
+                _ = sigterm.recv() => {}
+                _ = tokio::signal::ctrl_c() => {}
+            }
+        })
+        .await?;
+        let Some(adapter) = adapter else {
+            break;
+        };
+        // The adapter part is set up again if it comes back, so its
+        // removal must not end the resumable sessions.
+        let adapter_name = adapter.name().to_owned();
+        wait_powered(&adapter).await?;
+        match serve_adapter(&mut p, adapter, &args, &name).await? {
+            AdapterEnd::Stopped => break,
+            AdapterEnd::Removed => info!(
+                "Bluetooth adapter {adapter_name} is gone; keeping {} resumable session(s) while it comes back",
+                p.registry.len()
+            ),
+        }
+    }
+    info!("shutting down");
+    let _ = p.shutdown_tx.send(true);
+    // Detached resumable sessions end when the shutdown signal reaches
+    // them; give them a moment to close their channels and log.
+    tokio::time::sleep(SHUTDOWN_GRACE).await;
+    Ok(())
+}
+
+async fn serve_adapter(
+    p: &mut Process,
+    adapter: Adapter,
+    args: &Args,
+    name: &str,
+) -> Result<AdapterEnd, Box<dyn std::error::Error>> {
     info!(
         "adapter {} ({}), advertising as {:?}",
         adapter.name(),
@@ -488,7 +571,13 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
         Err(e) => warn!("cannot read host key {}: {e}", args.host_key.display()),
     }
 
-    let sessions: Shared = Arc::default();
+    let session = &p.session;
+    let sessions = p.sessions.clone();
+    // Resumable sessions over all channels, by token.
+    let registry = p.registry.clone();
+    // Tells the sessions that the daemon is stopping; it is set once the
+    // whole process stops, not when an adapter goes away.
+    let shutdown = p.shutdown_rx.clone();
     // The L2CAP channel is the main transport; the GATT stream stays for
     // clients that cannot open one.
     // Channels in the order clients try them.
@@ -511,7 +600,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
     let psms: Vec<u16> = listeners.iter().map(|(_, p, _)| *p).collect();
     let psm = psms.first().copied();
 
-    let info_name = name.clone();
+    let info_name = name.to_owned();
     let info_psms = psms.clone();
     let info_resume = args.resume;
     // The device whose stream is open or being opened. INFO tells other
@@ -622,7 +711,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
         adapter.events().await?.boxed();
     wait_interfaces(&adapter).await?;
     let _app = adapter.serve_gatt_application(app).await?;
-    let mut adv = Some(advertise(&adapter, &name, args.discoverable).await?);
+    let mut adv = Some(advertise(&adapter, name, args.discoverable).await?);
     let channels: Vec<String> = listeners
         .iter()
         .map(|(_, p, m)| format!("PSM 0x{p:02x} (MTU {m})"))
@@ -636,10 +725,6 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
         }
     );
 
-    // Tells the sessions that the daemon is stopping.
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    // Resumable sessions over all channels, by token.
-    let registry = Registry::default();
     let accept_tasks: Vec<_> = listeners
         .into_iter()
         .map(|(l, _, _)| {
@@ -647,7 +732,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
                 adapter.clone(),
                 args.clone(),
                 sessions.clone(),
-                shutdown_rx.clone(),
+                shutdown.clone(),
                 registry.clone(),
             );
             tokio::spawn(accept_loop(l, adapter, args, sessions, shutdown, registry))
@@ -671,18 +756,15 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
     let (left_tx, mut left_rx) = mpsc::unbounded_channel::<Address>();
     let mut left_watch: Option<JoinHandle<()>> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(1));
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    loop {
+    let end = loop {
         *holder.lock().unwrap() = active.as_ref().map(|(a, _)| *a).or(pending.address());
         tokio::select! {
-            _ = sigterm.recv() => break,
-            _ = tokio::signal::ctrl_c() => break,
+            _ = p.sigterm.recv() => break AdapterEnd::Stopped,
+            _ = tokio::signal::ctrl_c() => break AdapterEnd::Stopped,
             Some(ev) = adapter_events.next() => {
                 if matches!(&ev, SessionEvent::AdapterRemoved(n) if n == adapter.name()) {
-                    // Exit with an error: systemd restarts the daemon, which
-                    // waits for the adapter and registers again.
-                    return Err(format!("Bluetooth adapter {} was removed", adapter.name()).into());
+                    break AdapterEnd::Removed;
                 }
             }
             ev = power_events.next() => match ev {
@@ -743,7 +825,14 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
                     }
                 }
                 Some(_) => {}
-                None => return Err("GATT application was unregistered".into()),
+                None => {
+                    // BlueZ drops the GATT application when the adapter goes
+                    // away; the daemon then waits for it to come back.
+                    if !adapter_present(session, adapter.name()).await? {
+                        break AdapterEnd::Removed;
+                    }
+                    return Err("GATT application was unregistered".into());
+                }
             },
             ev = tx_control.next() => match ev {
                 Some(CharacteristicControlEvent::Notify(writer)) => {
@@ -773,7 +862,12 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
                     }
                 }
                 Some(_) => {}
-                None => return Err("GATT application was unregistered".into()),
+                None => {
+                    if !adapter_present(session, adapter.name()).await? {
+                        break AdapterEnd::Removed;
+                    }
+                    return Err("GATT application was unregistered".into());
+                }
             },
             Some(addr) = left_rx.recv() => {
                 if deferred_disconnect.is_some_and(|(a, _)| a == addr) {
@@ -813,7 +907,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
                 // here raced with reconnecting clients in tests, so it is opt-in.
                 if args.readvertise {
                     adv = None;
-                    match advertise(&adapter, &name, args.discoverable).await {
+                    match advertise(&adapter, name, args.discoverable).await {
                         Ok(h) => adv = Some(h),
                         Err(e) => error!("re-registering advertisement failed: {e}"),
                     }
@@ -821,7 +915,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
             }
             _ = tick.tick() => {
                 if adv.is_none() && adapter.is_powered().await.unwrap_or(false) {
-                    match advertise(&adapter, &name, args.discoverable).await {
+                    match advertise(&adapter, name, args.discoverable).await {
                         Ok(h) => adv = Some(h),
                         Err(e) => debug!("advertising retry failed: {e}"),
                     }
@@ -885,7 +979,7 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
             };
             let adapter = adapter.clone();
             let args = args.clone();
-            let shutdown = shutdown_rx.clone();
+            let shutdown = shutdown.clone();
             active = Some((
                 addr,
                 tokio::spawn(async move {
@@ -893,31 +987,23 @@ async fn serve(args: Args, name: String) -> Result<(), Box<dyn std::error::Error
                 }),
             ));
         }
-    }
+    };
 
-    info!("shutting down");
+    // Nothing of this adapter may outlive it: the next adapter binds its
+    // own address and registers its own application and advertisement.
+    // Aborting the accept tasks also drops their L2CAP listeners.
     for t in &accept_tasks {
         t.abort();
     }
-    let others = sessions.lock().unwrap().devices();
-    // The GATT session sends CLOSE, so the client learns why it ended
-    // instead of keeping an idle link to a server that is gone; L2CAP
-    // sessions end with their channel.
-    let _ = shutdown_tx.send(true);
-    if let Some((addr, mut task)) = active {
-        if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
-            .await
-            .is_err()
-        {
-            task.abort();
-        }
-        disconnect_now(&adapter, addr).await;
+    if let Some(w) = left_watch.take() {
+        w.abort();
     }
-    for addr in others {
-        disconnect_now(&adapter, addr).await;
+    if let Some((_, task)) = active.take() {
+        task.abort();
     }
+    drop(_app);
     drop(adv);
-    Ok(())
+    Ok(end)
 }
 
 /// Disconnects a device in the background. Device1.Disconnect can take
@@ -932,24 +1018,6 @@ fn disconnect(adapter: &Adapter, addr: Address) {
             }
         }
     });
-}
-
-/// Ends the link of a stopping daemon: gives the client a moment to read
-/// CLOSE and disconnect by itself, then disconnects it.
-async fn disconnect_now(adapter: &Adapter, addr: Address) {
-    if tokio::time::timeout(SHUTDOWN_GRACE, disconnected(adapter, addr))
-        .await
-        .is_ok()
-    {
-        return;
-    }
-    if let Ok(dev) = adapter.device(addr) {
-        match tokio::time::timeout(Duration::from_secs(2), dev.disconnect()).await {
-            Ok(Err(e)) => debug!("{addr}: disconnect failed: {e}"),
-            Err(_) => debug!("{addr}: disconnect timed out"),
-            Ok(Ok(())) => {}
-        }
-    }
 }
 
 async fn is_connected(adapter: &Adapter, addr: Address) -> bool {

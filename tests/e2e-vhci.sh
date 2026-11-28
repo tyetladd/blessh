@@ -41,7 +41,10 @@ CFG
 systemd-socket-activate -l "$T/session.sock" --inetd -a "$BIN/blessh" server session -- /usr/sbin/sshd -i -f "$T/sshd_config" -E "$T/sshd.log" \
     > "$T/socket-activate.log" 2>&1 &
 SA=$!
-DAEMON_ARGS="--adapter $SERVER_HCI --name vhci-server --session-socket $T/session.sock --host-key $T/hostkey.pub --max-sessions 2"
+# bluetoothd's discovery drops advertisements without the LE-discoverable
+# bit, and btvirt's carry flags 0x04 only, so the daemon advertises as
+# discoverable here.
+DAEMON_ARGS="--adapter $SERVER_HCI --name vhci-server --session-socket $T/session.sock --host-key $T/hostkey.pub --max-sessions 2 --discoverable"
 if [ -n "${DAEMON_USER:-}" ]; then
     cp "$BIN/blessh" "$T/"
     sleep 1
@@ -72,8 +75,8 @@ SSH="ssh -F /dev/null -i $T/id -o IdentitiesOnly=yes -o BatchMode=yes -o StrictH
 run() {
     wait_link_down
     # shellcheck disable=SC2086
-    timeout 120 $SSH -o HostKeyAlias=vhci-server \
-        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy ${CONNECT_ARGS:-} --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
+    timeout 180 $SSH -o HostKeyAlias=vhci-server \
+        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy ${CONNECT_ARGS:-} --scan-timeout 60 --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
         "$(id -un)@vhci-server" "$@"
 }
 
@@ -81,23 +84,24 @@ run() {
 # reuses it.
 run_keep() {
     # shellcheck disable=SC2086
-    timeout 60 $SSH -o HostKeyAlias=vhci-server \
-        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy --keep-link ${CONNECT_ARGS:-} --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
+    timeout 150 $SSH -o HostKeyAlias=vhci-server \
+        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy --keep-link --scan-timeout 60 ${CONNECT_ARGS:-} --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
         "$(id -un)@vhci-server" "$@"
 }
 
 # Without waiting for other clients: several sessions over one link.
 run_now() {
     # shellcheck disable=SC2086
-    timeout 60 $SSH -o HostKeyAlias=vhci-server \
-        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy ${CONNECT_ARGS:-} --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
+    timeout 150 $SSH -o HostKeyAlias=vhci-server \
+        -o ProxyCommand="env RUST_LOG=info $BIN/blessh proxy ${CONNECT_ARGS:-} --scan-timeout 60 --adapter $CLIENT_HCI $SERVER 2>>$T/connect.log" \
         "$(id -un)@vhci-server" "$@"
 }
 
-# With btvirt the first scans after start-up sometimes see no advertisement
-# at all (not seen on real controllers); wait until the server is visible.
+# With btvirt, discovery through bluetoothd can take up to a minute even
+# with --discoverable (not seen on real controllers); the proxy scans wait
+# for it too.
 for _ in 1 2 3 4 5 6; do
-    "$BIN/blessh" scan --adapter "$CLIENT_HCI" --timeout 8 2>/dev/null | grep -q "$SERVER" && break
+    "$BIN/blessh" scan --adapter "$CLIENT_HCI" --timeout 30 2>/dev/null | grep -q "$SERVER" && break
 done
 
 head -c 100000 /dev/urandom > "$T/blob"
@@ -123,7 +127,7 @@ grep -q "client connected (l2cap, " "$T/daemon.log" || { echo "FAIL: server did 
 grep -q "transport l2cap" "$T/socket-activate.log" || { echo "FAIL: session helper did not log the transport"; exit 1; }
 
 echo "== ssh through the blessh wrapper"
-out=$(wait_link_down; BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI" timeout 120 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
+out=$(wait_link_down; BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --scan-timeout 60" timeout 180 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
     -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" "$(id -un)@$SERVER" 'echo via-wrapper')
 [ "$out" = via-wrapper ] || { echo "FAIL: wrapper: $out"; exit 1; }
 grep -q "^blessh-$(echo "$SERVER" | tr -d : | tr 'A-F' 'a-f') " "$T/known_hosts" || { echo "FAIL: wrapper did not set the host key alias"; exit 1; }
@@ -165,10 +169,18 @@ wait $A $B
 
 echo "== session ends when the client disappears"
 wait_link_down
+# Not resumable: the daemon would keep a resumable session (and its sshd)
+# for --resume seconds. Kill only the client proxy: the daemon is also
+# named blessh since both are one program.
+CONNECT_ARGS="--resume 0"
 (run -tt 'sleep 4242' < /dev/null > /dev/null 2>&1 &)
-sleep 8
+for _ in $(seq 180); do
+    pgrep -x sleep -a | grep -q 4242 && break
+    sleep 0.5
+done
 pgrep -x sleep -a | grep -q 4242 || { echo "FAIL: remote command did not start"; exit 1; }
-pkill -x blessh
+pkill -f "blessh proxy" || true
+unset CONNECT_ARGS
 sleep 5
 if pgrep -x sleep -a | grep -q 4242; then echo "FAIL: session survived disconnect"; exit 1; fi
 
@@ -210,6 +222,71 @@ if [ -n "${DAEMON_USER:-}" ]; then
         as_daemon $call | grep -q AccessDenied || { echo "FAIL: allowed: $call"; exit 1; }
     done
 fi
+
+echo "== daemon keeps resumable sessions while its adapter goes away and comes back"
+removals() { grep -c "is gone; keeping" "$T/daemon.log" 2>/dev/null || true; }
+resumable() { grep -c "resumable SSH session started" "$T/daemon.log" 2>/dev/null || true; }
+wait_link_down
+started=$(resumable)
+BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --resume 60 --scan-timeout 60" timeout 300 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" \
+    "$(id -un)@$SERVER" 'for i in $(seq 1 90); do echo tick $i; sleep 1; done' \
+    > "$T/ticks.log" 2> "$T/ticks.err" &
+TICKS=$!
+for _ in $(seq 180); do
+    [ "$(resumable)" -gt "$started" ] && break
+    sleep 0.5
+done
+[ "$(resumable)" -gt "$started" ] ||
+    { echo "FAIL: the resumable session did not start"; tail -20 "$T/daemon.log" "$T/ticks.err" 2>/dev/null || true; exit 1; }
+sleep 5
+sudo pkill -x btvirt
+sleep 3
+sudo btvirt -L -l2 > "$T/btvirt.log" 2>&1 &
+POWERED=
+for _ in $(seq 60); do
+    POWERED=$(busctl get-property org.bluez "/org/bluez/$SERVER_HCI" org.bluez.Adapter1 Powered 2>/dev/null || true)
+    [ "$POWERED" = "b true" ] && break
+    sleep 0.5
+done
+[ "$POWERED" = "b true" ] || { echo "FAIL: $SERVER_HCI did not come back powered"; exit 1; }
+TICKS_STATUS=0
+wait "$TICKS" || TICKS_STATUS=$?
+grep -q "is gone; keeping 1 resumable session(s) while it comes back" "$T/daemon.log" ||
+    { echo "FAIL: no removal log line"; grep -E "adapter|advertising" "$T/daemon.log" | tail -20; exit 1; }
+[ "$(grep -c "advertising as" "$T/daemon.log")" -ge 2 ] ||
+    { echo "FAIL: the daemon did not advertise again"; exit 1; }
+kill -0 "$D" 2>/dev/null || { echo "FAIL: the daemon restarted"; exit 1; }
+expected=$(seq 1 90 | sed 's/^/tick /')
+got=$(cat "$T/ticks.log")
+if [ "$TICKS_STATUS" = 0 ] && grep -q "resumed (resume" "$T/daemon.log" && [ "$got" = "$expected" ]; then
+    echo "   client resumed, the stream had no gap"
+else
+    echo "NOTE: client side not checked (client adapter was removed too)"
+    echo "   client exit status $TICKS_STATUS, $(wc -l < "$T/ticks.log") ticks"
+fi
+
+echo "== daemon stops while its adapter is gone"
+before=$(removals)
+sudo pkill -x btvirt
+for _ in $(seq 120); do
+    [ "$(removals)" -gt "$before" ] && break
+    sleep 0.5
+done
+[ "$(removals)" -gt "$before" ] || { echo "FAIL: the daemon did not notice the adapter removal"; exit 1; }
+# With DAEMON_USER, $D is sudo's pid; signal the daemon itself.
+DPID=$D
+if [ -n "${DAEMON_USER:-}" ]; then
+    DPID=$(pgrep -P "$D" -x blessh) || DPID=$D
+fi
+kill -TERM "$DPID" 2>/dev/null || { echo "FAIL: the daemon is not running while its adapter is gone"; exit 1; }
+( sleep 5; kill -KILL "$DPID" 2>/dev/null ) &
+WATCH=$!
+STATUS=0
+wait "$D" || STATUS=$?
+kill "$WATCH" 2>/dev/null || true
+[ "$STATUS" = 0 ] ||
+    { echo "FAIL: the daemon exited with status $STATUS after SIGTERM while the adapter was gone"; exit 1; }
 
 grep -E "rejecting|no longer connected|did not open|refused" "$T/daemon.log" | sed 's/^/   daemon: /' || true
 echo PASS
