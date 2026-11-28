@@ -385,9 +385,13 @@ git commit -m "Packaging: blessh-adapter-watch.service, started with the server"
 
 - [ ] **Step 1: Write the case**
 
-Start `sudo $BIN/blessh server adapter-watch --adapter $SERVER_HCI --interval 1 --reset-command "kill -CONT $(pgrep -x btvirt); sleep 1; btmgmt --index ${SERVER_HCI#hci} power off; btmgmt --index ${SERVER_HCI#hci} power on" > $T/watch.log 2>&1 &`. Start the resumable `ticks` session as in Task 5. After 5 s, `sudo kill -STOP $(pgrep -x btvirt)`.
+Start `sudo $BIN/blessh server adapter-watch --adapter $SERVER_HCI --interval 1 --reset-command "kill -CONT $(pgrep -x btvirt); sleep 1" > $T/watch.log 2>&1 &`. Start the resumable `ticks` session as in Task 5. After 5 s, `sudo kill -STOP $(pgrep -x btvirt)`.
 
-Pass when, within 40 s: `watch.log` has `did not answer 2 probes; resetting`, then `answers again`; the daemon pid is unchanged; the daemon log shows `resumed`; `ticks.log` is complete with no gap. On failure, `kill -CONT` btvirt in the trap so later runs are not left with a frozen controller.
+The reset command only continues the frozen controller: on a frozen vhci controller `btmgmt power off` blocks past the 40 s window (the kernel's HCI device close waits on the probe that timed out), so the case does not power-cycle the adapter.
+
+Pass when, within 40 s: `watch.log` has `did not answer 2 probes; resetting`, then `answers again`; the daemon pid is unchanged; the session survives without a channel loss (it has no `channel lost` line and its end line says `0 resumes`); `ticks.log` is exactly `tick 1` … `tick 90`. On failure, `kill -CONT` btvirt in the trap so later runs are not left with a frozen controller.
+
+A freeze-only reset keeps the vhci link, so the case asserts session survival; the adapter-removal resume path is Task 5's.
 
 - [ ] **Step 2: Run it**
 

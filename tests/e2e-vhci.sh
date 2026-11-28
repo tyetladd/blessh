@@ -272,6 +272,97 @@ else
     echo "   client resumed, the stream had no gap"
 fi
 
+echo "== watchdog resets a controller that stopped answering"
+# The watchdog (root: raw HCI) probes the controller and resets it with a
+# test command instead of a driver rebind: continuing the frozen btvirt is
+# the reset. The command does not power-cycle the adapter: on a frozen vhci
+# controller `btmgmt power off` blocks past the 40 s window. A freeze-only
+# reset keeps the link up, so the session must survive it without a channel
+# loss and deliver the whole tick stream; the adapter-removal resume path is
+# Task 5's case.
+wait_link_down
+started=$(resumable)
+sudo "$BIN/blessh" server adapter-watch --adapter "$SERVER_HCI" --interval 1 \
+    --reset-command "kill -CONT $(pgrep -x btvirt); sleep 1" \
+    > "$T/watch.log" 2>&1 &
+WATCHDOG=$!
+# A failure must not leave the controller frozen for the next run.
+trap 'kill ${WATCHDOG:-} $D $SA 2>/dev/null || true; sudo pkill -CONT -x btvirt 2>/dev/null || true' EXIT
+for _ in $(seq 20); do
+    grep -q "watching $SERVER_HCI" "$T/watch.log" && break
+    sleep 0.5
+done
+grep -q "watching $SERVER_HCI" "$T/watch.log" ||
+    { echo "FAIL: the watchdog did not start"; cat "$T/watch.log"; exit 1; }
+BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --resume 60 --scan-timeout 60" timeout 300 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" \
+    "$(id -un)@$SERVER" 'for i in $(seq 1 90); do echo tick $i; sleep 1; done' \
+    > "$T/ticks2.log" 2> "$T/ticks2.err" &
+TICKS=$!
+for _ in $(seq 180); do
+    [ "$(resumable)" -gt "$started" ] && break
+    sleep 0.5
+done
+[ "$(resumable)" -gt "$started" ] ||
+    { echo "FAIL: the resumable session did not start"; tail -20 "$T/daemon.log" "$T/ticks2.err" 2>/dev/null || true; exit 1; }
+SESSION_ID=$(sed -n 's/.*: session \([0-9a-f]*\): resumable SSH session started.*/\1/p' "$T/daemon.log" | tail -1)
+[ -n "$SESSION_ID" ] ||
+    { echo "FAIL: cannot read the new session id"; tail -20 "$T/daemon.log"; exit 1; }
+sleep 5
+BT=$(pgrep -x btvirt || true)
+[ -n "$BT" ] || { echo "FAIL: no btvirt to freeze"; exit 1; }
+frozen=$(date +%s)
+sudo kill -STOP $BT
+# Pass when the watchdog resets within two missed probes and sees the
+# controller answer once the 30 s cooldown after the reset is over, all
+# within 40 s of the freeze.
+reset_line= again_line=
+for _ in $(seq 80); do
+    reset_line=$(grep -n "did not answer 2 probes; resetting" "$T/watch.log" | head -1 | cut -d: -f1)
+    again_line=$(grep -n "answers again" "$T/watch.log" | head -1 | cut -d: -f1)
+    [ -n "$reset_line" ] && [ -n "$again_line" ] && break
+    sleep 0.5
+done
+elapsed=$(( $(date +%s) - frozen ))
+if [ -z "$reset_line" ] || [ -z "$again_line" ] || [ "$reset_line" -ge "$again_line" ] || [ "$elapsed" -gt 40 ]; then
+    echo "FAIL: no reset and recovery within 40 s (${elapsed}s after the freeze)"
+    cat "$T/watch.log"
+    grep -E "adapter|resum|is gone" "$T/daemon.log" | tail -20 || true
+    exit 1
+fi
+kill -TERM "$WATCHDOG" 2>/dev/null || true
+wait "$WATCHDOG" 2>/dev/null || true
+WATCHDOG=
+echo "   the watchdog reset $SERVER_HCI (${elapsed}s after the freeze)"
+TICKS_STATUS=0
+wait "$TICKS" || TICKS_STATUS=$?
+kill -0 "$D" 2>/dev/null || { echo "FAIL: the daemon restarted"; exit 1; }
+[ "$TICKS_STATUS" -eq 0 ] ||
+    { echo "FAIL: the client exited with status $TICKS_STATUS, $(wc -l < "$T/ticks2.log") ticks"; tail -20 "$T/ticks2.err" 2>/dev/null || true; exit 1; }
+# The freeze only stalls the link; the session must survive it: no channel
+# loss, no resume, a normal client close, and the whole tick stream.
+for _ in $(seq 40); do
+    grep -q "session $SESSION_ID: ended " "$T/daemon.log" && break
+    sleep 0.25
+done
+! grep -q "session $SESSION_ID: channel lost" "$T/daemon.log" ||
+    { echo "FAIL: the session lost its channel"; grep "session $SESSION_ID" "$T/daemon.log" | tail -10; exit 1; }
+end_line=$(grep "session $SESSION_ID: ended " "$T/daemon.log" | tail -1)
+case $end_line in
+    *", 0 resumes: client closed the session"*) ;;
+    *)
+        echo "FAIL: the session did not end normally without a resume"
+        echo "   ${end_line:-no end line for session $SESSION_ID}"
+        grep "session $SESSION_ID" "$T/daemon.log" | tail -10
+        exit 1
+        ;;
+esac
+expected=$(seq 1 90 | sed 's/^/tick /')
+got=$(cat "$T/ticks2.log")
+[ "$got" = "$expected" ] ||
+    { echo "FAIL: the tick stream has a gap ($(wc -l < "$T/ticks2.log") of 90 lines)"; exit 1; }
+echo "   the daemon kept its pid, the session survived, the stream had no gap"
+
 echo "== daemon stops while its adapter is gone"
 before=$(removals)
 sudo pkill -x btvirt
