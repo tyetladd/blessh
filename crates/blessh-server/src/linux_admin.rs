@@ -158,12 +158,13 @@ fn adapter_arg(args: &str) -> Option<&str> {
     None
 }
 
-/// Whether the daemon and the watchdog watch different adapters: only
-/// when both arguments name one, as the watchdog otherwise picks its own.
+/// Whether the watchdog may watch a different adapter than the daemon:
+/// when `BLESSH_ARGS` names one and `BLESSH_WATCH_ARGS` does not (the
+/// watchdog then picks its own), or when the two name different ones.
 fn adapter_mismatch(defaults: &str) -> bool {
     let server = adapter_arg(defaults_value(defaults, "BLESSH_ARGS").unwrap_or_default());
     let watch = adapter_arg(defaults_value(defaults, "BLESSH_WATCH_ARGS").unwrap_or_default());
-    matches!((server, watch), (Some(a), Some(b)) if a != b)
+    server.is_some_and(|a| watch != Some(a))
 }
 
 /// What the adapter watchdog does, for `status`.
@@ -496,7 +497,10 @@ fn status() -> i32 {
         println!("last reset: {}", last.trim_end());
     }
     if adapter_mismatch(&defaults) {
-        println!("warning: --adapter differs between BLESSH_ARGS and BLESSH_WATCH_ARGS");
+        println!(
+            "warning: the adapter watchdog may watch a different adapter; \
+             set the same --adapter in BLESSH_WATCH_ARGS"
+        );
     }
     if running {
         0
@@ -548,8 +552,9 @@ mod tests {
         assert!(!adapter_mismatch(
             "BLESSH_ARGS=\"--adapter hci0\"\nBLESSH_WATCH_ARGS=\"--adapter hci0\"\n"
         ));
-        // The warning needs both adapters: one argument alone is fine.
-        assert!(!adapter_mismatch("BLESSH_ARGS=\"--adapter hci0\"\n"));
+        // A watchdog-only argument is fine; a daemon-only one is not: the
+        // watchdog then picks the lowest-numbered adapter itself.
+        assert!(adapter_mismatch("BLESSH_ARGS=\"--adapter hci0\"\n"));
         assert!(!adapter_mismatch("BLESSH_WATCH_ARGS=\"--adapter hci1\"\n"));
         assert!(!adapter_mismatch(""));
     }

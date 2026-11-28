@@ -169,7 +169,9 @@ last reset: <time> rebind hci_uart_bcm (serial0-0)
 The first line reads `adapter watchdog: off (BLESSH_ADAPTER_WATCH=no)` when
 turned off in `/etc/default/blessh` and `not running` when the unit is not
 active. If `BLESSH_ARGS` sets `--adapter`, set the same one in
-`BLESSH_WATCH_ARGS`; `blessh server status` warns when they differ.
+`BLESSH_WATCH_ARGS`: the watchdog otherwise picks the lowest-numbered
+adapter, which may be a different one. `blessh server status` warns when
+the two differ or when only `BLESSH_ARGS` names one.
 
 A resumable session survives the reset: the reset drops the link, and the
 client resumes the session on a new channel within its resume window

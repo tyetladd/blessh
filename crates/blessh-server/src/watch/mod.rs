@@ -48,11 +48,19 @@ struct Args {
     /// The adapter to watch, for example hci0 (default: the first one).
     #[arg(long)]
     adapter: Option<String>,
-    /// Seconds between probes.
-    #[arg(long, default_value_t = 5)]
+    /// Seconds between probes (1 to 3600).
+    #[arg(
+        long,
+        default_value_t = 5,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
     interval: u64,
-    /// Seconds to wait for a probe's answer.
-    #[arg(long, default_value_t = 2)]
+    /// Seconds to wait for a probe's answer (1 to 3600).
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_parser = clap::value_parser!(u64).range(1..=3600)
+    )]
     timeout: u64,
     /// The sysfs root (a test hook).
     #[arg(long, default_value = "/sys", hide = true)]
@@ -425,6 +433,24 @@ mod tests {
             last_reset_line(1_700_000_000, "x"),
             "2023-11-14T22:13:20Z x\n"
         );
+    }
+
+    #[test]
+    fn rejects_out_of_range_interval_and_timeout() {
+        // A zero timeout makes every probe a missed answer (two misses
+        // reset a healthy controller), a zero interval probes without a
+        // pause, and a huge timeout overflows the probe's deadline.
+        for args in [
+            ["adapter-watch", "--interval", "0"],
+            ["adapter-watch", "--timeout", "0"],
+            ["adapter-watch", "--interval", "3601"],
+            ["adapter-watch", "--timeout", "3601"],
+        ] {
+            assert!(Args::try_parse_from(args).is_err(), "{args:?} was accepted");
+        }
+        assert!(Args::try_parse_from(["adapter-watch", "--interval", "1"]).is_ok());
+        assert!(Args::try_parse_from(["adapter-watch", "--timeout", "1"]).is_ok());
+        assert!(Args::try_parse_from(["adapter-watch"]).is_ok());
     }
 
     /// The gaps between consecutive probes, in seconds.
