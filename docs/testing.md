@@ -39,6 +39,40 @@ hours and need root, a lot of memory or the bench, so they are not in CI.
 | Bench: client and server over the radio (installed packages on two bench nodes), both directions | `tests/e2e-bench.sh -s 1 <name>` (smoke, under a minute), `-s 2` (basics, a few minutes), `-s 3` (1 MB each way, 20 sessions in a row, link loss; about 10 minutes) on the client node; run the stages in this order |
 | Bench: two client devices at the same time, phones, the macOS client and server against Linux and each other | by hand; not covered by btvirt (see architecture.md, "Verified so far"); the macOS binaries were built and started but could not reach Bluetooth without the permission prompt being answered |
 | Bench: install and upgrade | S1, S13 and the other cases below that need no phone |
+| Bench: adapter watchdog: a controller that stops answering gets its driver rebound, and a resumable session resumes | the procedure under "Adapter watchdog on hardware" below |
+
+### Adapter watchdog on hardware
+
+The watchdog's decision path is covered by unit tests, and
+`tests/e2e-vhci.sh` checks the reset against a frozen virtual controller
+and that a running session survives it; the real sysfs rebind needs a
+controller that stops answering.
+A Raspberry Pi 3 Model B on a weak power supply does that on its own:
+undervoltage corrupts the UART between the kernel and the onboard
+controller, which then stops answering while the kernel still reports it
+powered (linux.md, "Adapter watchdog";
+[issue #3](https://github.com/tyetladd/blessh/issues/3)).
+
+1. Install the package and check the watchdog before a client connects:
+   `blessh server status` ends with `adapter watchdog: on`,
+   `systemctl status blessh-adapter-watch` shows it active, and
+   `journalctl -u blessh-adapter-watch` starts with
+   `watching hci0: probing every 5s`.
+2. Run a resumable session from a client with a steady stream into a file,
+   for example `while :; do sudo dmesg; sleep 1; done` (the Linux and macOS
+   clients ask for a resumable session by default; `--resume` defaults to
+   120 s).
+3. On the server, watch `sudo dmesg -w` and
+   `sudo journalctl -f -u blessh-adapter-watch -u blessh-server` for
+   `Received unexpected HCI Event 0x00` (or `Frame reassembly failed`).
+4. Pass when the watchdog journal then shows `did not answer 2 probes;
+   resetting` and later `answers again`, the server journal shows the
+   session resuming on a new channel (`channel resumes session`), and the
+   client's file keeps growing without a new login. Record the kernel,
+   reset, recovery and resume times in [hardware.md](hardware.md).
+
+A dip cannot be produced on demand; run until one happens, for at most 30
+minutes. Without one, record `UNTESTED on hardware`.
 
 Bench nodes are shared: before a run, say which nodes it uses and for how
 long, and nobody else touches them until the run is reported finished.

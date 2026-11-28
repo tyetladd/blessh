@@ -84,7 +84,8 @@ crates/blessh-ble      platform Bluetooth layer shared by server and client:
                        BlueZ (GATT packet transports, L2CAP helpers) and
                        CoreBluetooth (central, peripheral, L2CAP streams)
 crates/blessh-server   the server as a library: `blessh server run` (daemon),
-                       enable/disable/status, `session` (Linux root helper)
+                       enable/disable/status, `session` (Linux root helper),
+                       `adapter-watch` (Linux root watchdog)
 crates/blessh-client   the one program, blessh: ssh wrapper, scan, proxy, and
                        `blessh server` from blessh-server
 packaging/linux        systemd units, sshd_config, D-Bus policy, sysusers,
@@ -109,6 +110,16 @@ Every session, whichever transport, becomes one connection to
 `sshd_config`. sshd sees the client as "UNKNOWN", so `Match Address` and
 `PerSourcePenalties` do not apply to BLE.
 
+The package also installs `blessh-adapter-watch.service`, which starts with
+the server (`Wants=`) and stops and restarts with it (`PartOf=`). It runs
+`blessh server adapter-watch` as root with only `CAP_NET_RAW`: every 5 s it
+sends the controller HCI Read Local Version Information on a raw HCI
+socket, and when two probes in a row go unanswered it unbinds and binds
+the controller's driver through sysfs. The daemon itself keeps running: its
+sessions, registry and shutdown handling live as long as the process, while
+the GATT application, advertisement and L2CAP listeners belong to one
+adapter instance and are set up again when it comes back.
+
 On macOS the server is a Homebrew service (a LaunchAgent) in the user's
 session, since CoreBluetooth refuses daemons, and serves INFO and the PSM
 but not the GATT stream. It hands every channel to a launchd job that
@@ -130,6 +141,11 @@ feature works unchanged.
 ## Sessions
 
 * One session per L2CAP channel; one at a time over the GATT stream.
+* A resumable session survives an adapter reset: the reset drops the link,
+  the daemon keeps the session and its sshd connection while the adapter is
+  away, and the client resumes the session on a new channel when the
+  adapter is back. Sessions that are not resumable, and the GATT stream,
+  end with the link.
 * `--max-sessions` (default 4) bounds all sessions together; the session
   socket's `MaxConnections` must allow as many. A channel opened beyond
   the limit is refused in the channel handshake (`busy (4 sessions)`,

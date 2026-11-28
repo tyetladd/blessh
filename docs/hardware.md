@@ -30,6 +30,7 @@ version.
 | 2026-10-26 | Raspberry Pi Zero 2 W Rev 1.0 | Raspberry Pi OS (Debian 12 bookworm), 64-bit, image 2026-10-06 | 6.12.109+rpt-rpi-v8 | 5.66-1+rpt2+deb12u2 | 9.2p1 | 0.2.2-1 arm64 | `ble-term-connect` on another bench node | pass | pass | pass | — | — | — | pass | pass | — | pass | — | pass | pass | — | Upgrade, purge, clean install; without `Channels = 1` (the package turns ECRED off) |
 | 2026-10-26 | Raspberry Pi 5 Model B Rev 1.1 | Raspberry Pi OS (Debian 13 trixie), 64-bit, image 2026-10-06 | 6.18.50+rpt-rpi-2712 | 5.82-1.1+rpt2 | 10.0p1 | 0.2.2-1 arm64 | `ble-term-connect` on another bench node | pass | pass | pass | — | — | — | pass | pass | — | — | — | pass | pass | pass | Upgrade, purge, clean install; server role only. S14: a session with output every 30 s for 70 min, all lines received |
 | 2026-10-26 | Flipper One F2 (prototype; Rockchip RK3576, MediaTek MT7921 USB Bluetooth) | FlipperOS (Debian 13 trixie), Minimal profile (no desktop) | 7.3.0-rc7 | 5.82-1.1 | 10.0p1 | 0.2.2-1 arm64 | `ble-term-connect` on another bench node | pass | pass | pass | — | — | — | pass | pass | — | pass | — | pass | pass | — | Upgrade, purge, clean install, reboot. 100 sessions back to back from the Pi Zero 2 W: 100/100. WirePlumber stopped for the runs |
+| 2026-11-28 | Raspberry Pi 3 Model B Rev 1.2 (onboard BCM43430, UART) | Ubuntu 26.04 LTS, 64-bit | 7.0.0-1020-raspi | 5.85-4ubuntu0.4 | 10.2p1 | 0.3.1~local-1 arm64 | macOS CLI (`blessh` 0.3.1, installed) | — | — | — | — | — | — | — | — | — | — | — | — | — | — | Undervoltage stops the controller during long output ([issue #3](https://github.com/tyetladd/blessh/issues/3)). The watchdog was UNTESTED on hardware: no undervoltage or HCI error in 30 min of repeated `dmesg` output over a resumable session (09:09–09:39 UTC). Package and unit checks pass: `adapter watchdog: on`, unit active, `watching hci0: probing every 5s`; `BLESSH_ADAPTER_WATCH=no` skips the unit and `blessh server status` says off. |
 
 Notes on devices:
 
@@ -45,6 +46,12 @@ Notes on devices:
   (BCM43455 on UART) reported "hardware error 0x00" (twice so far); the
   reset failed and the adapter stayed off until a reboot. Not seen on the
   other boards.
+* **Raspberry Pi 3 Model B:** its controller (BCM43430 on UART) stops
+  answering when an undervoltage dip corrupts a UART frame during large
+  session output; the kernel still reports the adapter powered and the
+  link connected, and only a rebind of the HCI driver brings the chip back
+  ([issue #3](https://github.com/tyetladd/blessh/issues/3)). The adapter
+  watchdog is for this failure; see the row above for the hardware run.
 * **Raspberry Pi Zero 2 W:** logins take 3 to 11 s over BLE (Pi 3 B+ and
   Pi 5: 3 to 4 s). The link runs at a 48.75 ms connection interval without
   data length extension, and the controller sends about one 27 byte packet

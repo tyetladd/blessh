@@ -103,6 +103,96 @@ transport, followed by sshd's login lines. Phones use private BLE
 addresses that change every few minutes, so the address identifies a
 connection rather than a phone.
 
+## Adapter watchdog
+
+`blessh-adapter-watch.service` starts with the server and resets the
+Bluetooth controller when it stops answering. Every 5 s it sends HCI Read
+Local Version Information (opcode 0x1001, which `hcitool cmd 0x04 0x0001`
+also sends) on a raw HCI socket and waits up to 2 s for the answer. Two missed answers in a row mean the
+controller is dead: the watchdog unbinds and binds its driver through sysfs
+(`hci_uart_bcm` on `serial0-0` for a Raspberry Pi's onboard controller,
+`btusb` for a USB one), which makes the chip start again without a reboot.
+It then waits for the adapter to come back and 30 s longer before probing
+again, and resets at most three times in ten minutes; after that it logs
+the error once and keeps probing. An adapter that is down or absent is not
+probed: that is bluetoothd's or the administrator's doing, and the server
+waits for it.
+
+The failure it addresses: on a Raspberry Pi 3 Model B with a weak power
+supply, `Undervoltage detected!` is followed by a corrupted UART frame to
+the onboard controller during large session output, and the controller
+stops answering while the kernel still reports the adapter powered and the
+link connected. Clients cannot connect and the server sees no channel loss,
+so without a person who rebinds the driver the server stays unreachable
+([issue #3](https://github.com/tyetladd/blessh/issues/3)). A stronger power
+supply fixes the cause on that board; the watchdog is for the general case:
+any controller that stops answering would otherwise leave a headless server
+unreachable.
+
+The watchdog runs as root with only `CAP_NET_RAW` in its capability
+bounding set, watches the lowest-numbered adapter unless
+`BLESSH_WATCH_ARGS="--adapter hci1"` names another one, and logs to its own
+journal:
+
+```
+journalctl -u blessh-adapter-watch
+```
+
+```
+watching hci0: probing every 5s
+hci0 did not answer 2 probes; resetting (rebind hci_uart_bcm (serial0-0)). If this repeats, check the power supply and the kernel log.
+hci0 answers again
+```
+
+These are the other messages:
+
+```
+hci0 did not answer 2 probes and cannot be reset (no driver to rebind)
+hci0 was reset 3 times in 10 minutes and still does not answer; not resetting it again
+```
+
+The first is for a controller without a driver to rebind (a virtual one).
+A reset that fails is logged as `hci0: cannot reset the controller: <why>`.
+Probe errors that keep a command from being sent (a missing capability, for
+example) are logged as `hci0: cannot probe the controller: <why>` once per
+kind of error and are not missed answers, so they never reset a working
+controller.
+
+`blessh server status` shows the watchdog and, after a reset, its RFC 3339
+UTC time and what the watchdog did:
+
+```
+adapter watchdog: on
+last reset: <time> rebind hci_uart_bcm (serial0-0)
+```
+
+The first line reads `adapter watchdog: off (BLESSH_ADAPTER_WATCH=no)` when
+turned off in `/etc/default/blessh` and `not running` when the unit is not
+active. If `BLESSH_ARGS` sets `--adapter`, set the same one in
+`BLESSH_WATCH_ARGS`; `blessh server status` warns when they differ.
+
+A resumable session survives the reset: the reset drops the link, and the
+client resumes the session on a new channel within its resume window
+([client.md](client.md#lost-links)). Sessions that are not resumable, and
+the GATT stream, end with the link.
+
+To stop the watchdog until the next start of the server:
+
+```
+sudo systemctl stop blessh-adapter-watch
+```
+
+To turn it off for good while the server stays on, add to
+`/etc/default/blessh` and restart the server:
+
+```
+BLESSH_ADAPTER_WATCH=no
+```
+
+`sudo systemctl mask blessh-adapter-watch` also keeps it from starting.
+After `systemctl unmask`, or after removing the line,
+`sudo systemctl restart blessh-server` turns it on again.
+
 ## Turning the server off
 
 BLE logins are possible while `blessh-server.service` and
