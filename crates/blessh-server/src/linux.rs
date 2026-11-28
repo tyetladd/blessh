@@ -1005,6 +1005,14 @@ async fn serve_adapter(
         }
     };
 
+    // Stopping clients learn why: the GATT session sends CLOSE 3, and a
+    // resumable session sends a CLOSE record, instead of seeing a lost
+    // link and waiting out a resume window. A removed adapter is not the
+    // daemon stopping: its resumable sessions stay.
+    let stopped = matches!(&end, AdapterEnd::Stopped);
+    if stopped {
+        let _ = p.shutdown_tx.send(true);
+    }
     // Nothing of this adapter may outlive it: the next adapter binds its
     // own address and registers its own application and advertisement.
     // Aborting the accept tasks also drops their L2CAP listeners.
@@ -1014,8 +1022,20 @@ async fn serve_adapter(
     if let Some(w) = left_watch.take() {
         w.abort();
     }
-    if let Some((_, task)) = active.take() {
-        task.abort();
+    if let Some((addr, mut task)) = active.take() {
+        if stopped {
+            // Give the session its grace to send CLOSE 3, then abort one
+            // that does not end and drop the link.
+            if tokio::time::timeout(SHUTDOWN_GRACE, &mut task)
+                .await
+                .is_err()
+            {
+                task.abort();
+            }
+            disconnect_now(&adapter, addr).await;
+        } else {
+            task.abort();
+        }
     }
     drop(_app);
     drop(adv);
@@ -1034,6 +1054,24 @@ fn disconnect(adapter: &Adapter, addr: Address) {
             }
         }
     });
+}
+
+/// Ends the link of a stopping daemon: gives the client a moment to read
+/// CLOSE and disconnect by itself, then disconnects it.
+async fn disconnect_now(adapter: &Adapter, addr: Address) {
+    if tokio::time::timeout(SHUTDOWN_GRACE, disconnected(adapter, addr))
+        .await
+        .is_ok()
+    {
+        return;
+    }
+    if let Ok(dev) = adapter.device(addr) {
+        match tokio::time::timeout(Duration::from_secs(2), dev.disconnect()).await {
+            Ok(Err(e)) => debug!("{addr}: disconnect failed: {e}"),
+            Err(_) => debug!("{addr}: disconnect timed out"),
+            Ok(Ok(())) => {}
+        }
+    }
 }
 
 async fn is_connected(adapter: &Adapter, addr: Address) -> bool {

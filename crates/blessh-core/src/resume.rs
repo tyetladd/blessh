@@ -699,7 +699,7 @@ where
             } else {
                 attached_once = true;
                 let keep = a.keep;
-                let ended = run_attached(a.channel, &mut local, &mut state, async {
+                let ended = run_attached(&mut a.channel, &mut local, &mut state, async {
                     tokio::select! {
                         biased;
                         _ = &mut shutdown => Wake::Shutdown,
@@ -720,7 +720,18 @@ where
                         next = Some(a);
                         continue;
                     }
-                    Ended::Interrupted(Wake::Shutdown | Wake::Expired) => {
+                    Ended::Interrupted(Wake::Shutdown) => {
+                        // Tell the client why: without the CLOSE it sees a
+                        // lost channel and retries for its whole resume
+                        // window.
+                        let _ = a
+                            .channel
+                            .write_all(&encode_close(CLOSE_UNAVAILABLE, "server is shutting down"))
+                            .await;
+                        let _ = a.channel.flush().await;
+                        break 'session "server is shutting down".to_owned();
+                    }
+                    Ended::Interrupted(Wake::Expired) => {
                         break 'session "server is shutting down".to_owned()
                     }
                     Ended::Local => break 'session "server ended the session".to_owned(),

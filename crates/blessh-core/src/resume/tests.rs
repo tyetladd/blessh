@@ -713,3 +713,53 @@ async fn run_client_stop_sends_close() {
     assert!(s.end.starts_with("client closed the session"), "{}", s.end);
     assert!(registry.is_empty());
 }
+
+/// A server that is shutting down tells the attached client with CLOSE 3,
+/// so the client does not wait out its resume window for a channel that is
+/// gone.
+#[tokio::test]
+async fn shutdown_sends_close_on_the_attached_channel() {
+    let registry = Registry::default();
+    let (server_local, _sshd) = tokio::io::duplex(2048);
+    let (mut c, mut s) = tokio::io::duplex(1024);
+    let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+    let srv = tokio::spawn(async move {
+        let hello = channel::read_hello(&mut s).await.unwrap();
+        let attach = Attach {
+            channel: Box::new(s),
+            hello,
+            keep: Box::new(()),
+            peer: "test".into(),
+        };
+        serve(
+            server_local,
+            attach,
+            registry,
+            Config {
+                linger: Duration::from_secs(30),
+                replay: REPLAY,
+            },
+            async {
+                let _ = stop_rx.await;
+            },
+            |_| {},
+        )
+        .await
+    });
+    let _grant = open(&mut c, None).await.unwrap();
+    stop_tx.send(()).unwrap();
+    // The next record from the server is its CLOSE.
+    let mut head = [0u8; RECORD_HEADER];
+    tokio::time::timeout(Duration::from_secs(5), c.read_exact(&mut head))
+        .await
+        .expect("CLOSE arrives")
+        .unwrap();
+    assert_eq!(head[0], REC_CLOSE);
+    let len = u16::from_le_bytes([head[1], head[2]]) as usize;
+    let mut payload = vec![0u8; len];
+    c.read_exact(&mut payload).await.unwrap();
+    assert_eq!(payload[0], CLOSE_UNAVAILABLE);
+    assert_eq!(&payload[1..], b"server is shutting down");
+    let summary = srv.await.unwrap();
+    assert_eq!(summary.end, "server is shutting down");
+}

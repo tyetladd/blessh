@@ -262,6 +262,7 @@ git commit -m "Server: blessh server adapter-watch probes the controller and res
   - `struct Process { session: bluer::Session, sessions: Shared, registry: Registry, shutdown_tx: watch::Sender<bool>, shutdown_rx: watch::Receiver<bool>, sigterm: tokio::signal::unix::Signal }`
   - `async fn serve(args: Args, name: String) -> Result<(), Box<dyn Error>>` — creates `Process`; loops: `wait_adapter` (or stop) → `wait_powered` → `serve_adapter`; on `Removed` logs and loops, on `Stopped` breaks; then sends shutdown and gives detached sessions `SHUTDOWN_GRACE`.
   - `async fn serve_adapter(p: &mut Process, adapter: Adapter, args: &Args, name: &str) -> Result<AdapterEnd, Box<dyn Error>>` — today's body from the `adapter {} ({}), advertising as` log line through the end of the loop and its shutdown block, using `p`'s sessions/registry/shutdown instead of creating them. On every exit path it aborts `accept_tasks`, the active GATT task and `left_watch`, and drops `_app`, `adv` and the listeners.
+  - Ruling R16 (fix wave): on `AdapterEnd::Stopped` the shutdown signal is sent before `active` is taken, so the GATT task sends CLOSE 3; the daemon waits `SHUTDOWN_GRACE` for it and aborts only after that, then disconnects (`AdapterEnd::Removed` still aborts at once).
   - When `rx_control`/`tx_control` end: check `p.session.adapter_names()` for `adapter.name()`; absent → `Ok(AdapterEnd::Removed)`, present → today's error.
   - `SessionEvent::AdapterRemoved` → `Ok(AdapterEnd::Removed)` instead of `Err`.
 

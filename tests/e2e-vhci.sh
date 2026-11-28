@@ -20,6 +20,7 @@ BIN=$(pwd)/target/debug
 SERVER_HCI=${SERVER_HCI:-hci0}
 CLIENT_HCI=${CLIENT_HCI:-hci1}
 SERVER=$(busctl get-property org.bluez "/org/bluez/$SERVER_HCI" org.bluez.Adapter1 Address | cut -d'"' -f2)
+CLIENT=$(busctl get-property org.bluez "/org/bluez/$CLIENT_HCI" org.bluez.Adapter1 Address | cut -d'"' -f2)
 T=/tmp/blessh-vhci
 rm -rf "${T:?}"
 mkdir -p "$T"
@@ -422,6 +423,73 @@ kill "$WATCH" 2>/dev/null || true
 [ "$STATUS" = 0 ] ||
     { echo "FAIL: daemon exit status $STATUS after SIGTERM while the adapter was off"; exit 1; }
 sudo btmgmt --index "${SERVER_HCI#hci}" power on >/dev/null 2>&1 || true
+
+echo "== daemon tells both transports why it is stopping"
+# A GATT stream and a resumable L2CAP session at once; SIGTERM must end
+# each with CLOSE 3 ("server is shutting down"), not with a dropped link.
+# Without it the resumable client retries for its whole --resume window.
+# --keep-link leaves the shared link to the daemon, as a phone does.
+# BlueZ keeps the peer's GATT database and CCCD state by address. The
+# controllers were restarted with the same addresses, so those caches no
+# longer match the application a fresh daemon registers and a client with
+# them cannot subscribe (see the restart cases above); drop them first,
+# as for the other cases after a controller restart.
+sudo sh -c "rm -rf /var/lib/bluetooth/$SERVER/cache/$CLIENT /var/lib/bluetooth/$CLIENT/cache/$SERVER"
+RUST_LOG=debug "$BIN/blessh" server run $DAEMON_ARGS > "$T/daemon3.log" 2>&1 &
+D3=$!
+trap 'kill $D $SA $D3 2>/dev/null || true' EXIT
+for _ in $(seq 120); do
+    grep -q "ready (BlueZ GATT application" "$T/daemon3.log" && break
+    sleep 0.5
+done
+grep -q "ready (BlueZ GATT application" "$T/daemon3.log" ||
+    { echo "FAIL: the daemon did not start again"; tail -20 "$T/daemon3.log"; exit 1; }
+BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --gatt --keep-link --scan-timeout 60" timeout 300 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" \
+    "$(id -un)@$SERVER" 'sleep 60' > "$T/gatt-stop.log" 2>&1 &
+GATT=$!
+for _ in $(seq 240); do
+    grep -q "client connected (gatt, " "$T/daemon3.log" && break
+    sleep 0.5
+done
+grep -q "client connected (gatt, " "$T/daemon3.log" ||
+    { echo "FAIL: the GATT session did not start"; tail -20 "$T/daemon3.log" "$T/gatt-stop.log" 2>/dev/null || true; exit 1; }
+BLESSH_PROXY_ARGS="--adapter $CLIENT_HCI --resume 60 --keep-link --scan-timeout 60" timeout 300 "$BIN/blessh" -F /dev/null -i "$T/id" -o IdentitiesOnly=yes \
+    -o BatchMode=yes -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile="$T/known_hosts" \
+    "$(id -un)@$SERVER" 'sleep 60' > "$T/resume-stop.log" 2>&1 &
+RESUME=$!
+for _ in $(seq 240); do
+    grep -q "resumable SSH session started" "$T/daemon3.log" && break
+    sleep 0.5
+done
+grep -q "resumable SSH session started" "$T/daemon3.log" ||
+    { echo "FAIL: the resumable session did not start"; tail -20 "$T/daemon3.log" "$T/resume-stop.log" 2>/dev/null || true; exit 1; }
+kill -TERM "$D3" 2>/dev/null || { echo "FAIL: the daemon is not running"; exit 1; }
+# Both clients must react to CLOSE 3, not retry: failing that, they are
+# still running well after the daemon is gone.
+( sleep 15; touch "$T/clients-slow"; kill -TERM "$GATT" "$RESUME" 2>/dev/null || true ) &
+WATCH=$!
+( sleep 10; kill -KILL "$D3" 2>/dev/null ) &
+DWATCH=$!
+STATUS=0
+wait "$D3" || STATUS=$?
+kill "$DWATCH" 2>/dev/null || true
+wait "$GATT" || true
+wait "$RESUME" || true
+kill "$WATCH" 2>/dev/null || true
+[ "$STATUS" = 0 ] ||
+    { echo "FAIL: the daemon exited with status $STATUS after SIGTERM"; tail -20 "$T/daemon3.log"; exit 1; }
+[ ! -e "$T/clients-slow" ] ||
+    { echo "FAIL: a client was still retrying 15 s after the daemon's SIGTERM"; exit 1; }
+grep -q "server closed the link: SessionUnavailable server is shutting down" "$T/gatt-stop.log" ||
+    { echo "FAIL: the GATT client did not get CLOSE 3"; tail -20 "$T/gatt-stop.log"; exit 1; }
+grep -q "server closed the session: reason 3 server is shutting down" "$T/resume-stop.log" ||
+    { echo "FAIL: the resumable client did not get CLOSE 3"; tail -20 "$T/resume-stop.log"; exit 1; }
+! grep -q "channel lost" "$T/resume-stop.log" ||
+    { echo "FAIL: the resumable client saw a lost channel instead of CLOSE"; tail -20 "$T/resume-stop.log"; exit 1; }
+[ "$(grep -c "server is shutting down" "$T/daemon3.log")" -ge 2 ] ||
+    { echo "FAIL: the daemon did not end both sessions with CLOSE 3"; grep -E "session .*: ended" "$T/daemon3.log" | tail -10; exit 1; }
+echo "   the GATT and the resumable client both learned that the server is shutting down"
 
 grep -E "rejecting|no longer connected|did not open|refused" "$T/daemon.log" | sed 's/^/   daemon: /' || true
 echo PASS
